@@ -1,0 +1,15 @@
+{
+  "_comentario": "Umbrales de alerta. Se versionan junto al código para que cualquier cambio quede revisado en un pull request.",
+  "funcional": {
+    "max_pruebas_unitarias_fallidas": 0,
+    "max_escenarios_bdd_fallidos": 0,
+    "min_tasa_exito_porcentaje": 100
+  },
+  "performance": {
+    "latencia_p95_ms_advertencia": 300,
+    "latencia_p95_ms_critica": 500,
+    "tasa_errores_porcentaje_critica": 1,
+    "tps_minimo_advertencia": 10,
+    "degradacion_p95_porcentaje_vs_ejecucion_anterior": 20
+  }
+}

@@ -1,0 +1,236 @@
+# Pipeline de Integración Continua - qa-automatizacion-login
+#
+# Se dispara en cada push (cualquier rama), en cada pull request hacia main
+# o develop, y manualmente desde la pestaña Actions (workflow_dispatch).
+#
+# Etapas (jobs encadenados con "needs", del feedback más rápido al más lento):
+#   1. unitarias      -> compila y ejecuta JUnit 5. Publica reporte HTML.
+#   2. bdd            -> ejecuta escenarios Cucumber. Publica reporte HTML.
+#   3. performance    -> levanta la API y corre k6 con thresholds.
+#   4. dashboard      -> consolida métricas, publica dashboard y evalúa alertas.
+#   5. publicar       -> (solo main) publica dashboard + reportes en GitHub Pages.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+# Si llega un push nuevo a la misma rama, se cancela la ejecución anterior
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: "17"
+  MAVEN_OPTS: "-Dstyle.color=always"
+
+jobs:
+  # ------------------------------------------------------------------ 1
+  unitarias:
+    name: 1. Build y pruebas unitarias
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Java ${{ env.JAVA_VERSION }} con caché de Maven (~/.m2)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Compilar y ejecutar pruebas unitarias
+        run: mvn -B -ntp clean test
+
+      - name: Generar reporte HTML de pruebas unitarias
+        if: always()
+        run: mvn -B -ntp surefire-report:report-only -DoutputName=surefire
+
+      - name: Publicar reportes de pruebas unitarias
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-unitarias
+          path: |
+            target/surefire-reports/
+            target/reports/
+          retention-days: 14
+
+  # ------------------------------------------------------------------ 2
+  bdd:
+    name: 2. Escenarios BDD (Cucumber)
+    runs-on: ubuntu-latest
+    needs: unitarias
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      # -DskipUTs=true: las unitarias ya corrieron en el job anterior
+      - name: Ejecutar escenarios BDD
+        run: mvn -B -ntp clean verify -DskipUTs=true
+
+      - name: Publicar reporte Cucumber
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-bdd
+          path: target/cucumber-reports/
+          retention-days: 14
+
+  # ------------------------------------------------------------------ 3
+  performance:
+    name: 3. Prueba de performance (k6)
+    runs-on: ubuntu-latest
+    needs: bdd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Empaquetar la API
+        run: mvn -B -ntp clean package -DskipTests
+
+      - name: Levantar la API en segundo plano
+        run: |
+          nohup java -jar target/qa-automatizacion-login.jar > api.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/health && exit 0
+            sleep 1
+          done
+          echo "La API no levantó"; cat api.log; exit 1
+
+      - name: Instalar k6
+        uses: grafana/setup-k6-action@v1
+
+      # Si un threshold no se cumple, k6 sale con código 99 y el job falla
+      - name: Ejecutar prueba de carga
+        env:
+          K6_WEB_DASHBOARD: "true"
+          K6_WEB_DASHBOARD_EXPORT: target/performance/k6-reporte.html
+        run: |
+          mkdir -p target/performance
+          k6 run performance/login-carga.js
+
+      - name: Publicar resultados de performance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-performance
+          path: |
+            target/performance/
+            api.log
+          retention-days: 14
+
+  # ------------------------------------------------------------------ 4
+  dashboard:
+    name: 4. Dashboard de métricas y alertas
+    runs-on: ubuntu-latest
+    needs: [unitarias, bdd, performance]
+    if: always()   # se genera aunque una etapa anterior haya fallado
+    permissions:
+      contents: read
+      issues: write   # para abrir un issue cuando hay alertas críticas
+    outputs:
+      criticas: ${{ steps.alertas.outputs.criticas }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descargar reportes de las etapas anteriores
+        uses: actions/download-artifact@v4
+        with:
+          path: artefactos
+
+      - name: Ordenar reportes en la estructura del sitio
+        run: |
+          mkdir -p target sitio/reportes/{unitarias,bdd,performance}
+          cp -r artefactos/reporte-unitarias/surefire-reports target/ 2>/dev/null || true
+          cp -r artefactos/reporte-bdd target/cucumber-reports 2>/dev/null || true
+          cp -r artefactos/reporte-performance/target/performance target/ 2>/dev/null || true
+          # reporte HTML de Surefire con sus estilos (css, js, imágenes)
+          cp -r artefactos/reporte-unitarias/reports/. sitio/reportes/unitarias/ 2>/dev/null || true          cp artefactos/reporte-bdd/cucumber.html sitio/reportes/bdd/ 2>/dev/null || true
+          cp target/performance/k6-reporte.html sitio/reportes/performance/ 2>/dev/null || true
+
+      # Recupera el historial publicado en GitHub Pages para mostrar tendencias
+      - name: Recuperar historial de ejecuciones anteriores
+        run: |
+          URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/historial.json"
+          curl -sf "$URL" -o historial-anterior.json || echo "[]" > historial-anterior.json
+
+      - name: Generar dashboard
+        run: python3 scripts/generar_dashboard.py --historial historial-anterior.json --salida sitio
+
+      - name: Evaluar alertas
+        id: alertas
+        run: python3 scripts/evaluar_alertas.py --metricas sitio/metricas.json --historial sitio/historial.json --salida sitio
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Publicar dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-calidad
+          path: sitio/
+          retention-days: 30
+
+      # Alerta automática: abre (o comenta) un issue con el detalle
+      - name: Abrir issue de alerta
+        if: failure() && steps.alertas.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const cuerpo = fs.readFileSync('sitio/alertas.md', 'utf8') +
+              `\n\n[Ver ejecución del pipeline](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+            const titulo = `🚨 Alerta de calidad en ${context.ref.replace('refs/heads/', '')}`;
+            const abiertos = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', labels: 'alerta-calidad'
+            });
+            const existente = abiertos.data.find(i => i.title === titulo);
+            if (existente) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: existente.number, body: cuerpo
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo, title: titulo, body: cuerpo, labels: ['alerta-calidad']
+              });
+            }
+
+  # ------------------------------------------------------------------ 5
+  publicar:
+    name: 5. Publicar reportes en GitHub Pages
+    runs-on: ubuntu-latest
+    needs: dashboard
+    if: always() && github.ref == 'refs/heads/main' && needs.dashboard.result != 'skipped'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-calidad
+          path: sitio
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: sitio
+      - id: deploy
+        uses: actions/deploy-pages@v4

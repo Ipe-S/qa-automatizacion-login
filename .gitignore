@@ -1,0 +1,40 @@
+# --- Maven: todo lo que se genera al compilar/probar se reconstruye ---
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+release.properties
+dependency-reduced-pom.xml
+
+# --- Java ---
+*.class
+*.log
+hs_err_pid*
+replay_pid*
+
+# --- IDEs ---
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+bin/
+
+# --- Sistema operativo ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Python (scripts de dashboard) ---
+__pycache__/
+*.pyc
+
+# --- Resultados locales y secretos: nunca se versionan ---
+api.log
+sitio/
+.historial-local.json
+artefactos/
+.env
+*.env
